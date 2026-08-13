@@ -1398,39 +1398,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
   }
 
-  async function resolveStrandedIssueRecoveryOwnerAgentId(issue: typeof issues.$inferSelect) {
-    const candidateIds: string[] = [];
-    if (issue.assigneeAgentId) {
-      const assignee = await getAgent(issue.assigneeAgentId);
-      if (assignee?.reportsTo) candidateIds.push(assignee.reportsTo);
-    }
-    if (issue.createdByAgentId) {
-      const creator = await getAgent(issue.createdByAgentId);
-      if (creator?.reportsTo) candidateIds.push(creator.reportsTo);
-      candidateIds.push(issue.createdByAgentId);
-    }
-
-    const roleCandidates = await db
-      .select()
-      .from(agents)
-      .where(and(eq(agents.companyId, issue.companyId), inArray(agents.role, ["cto", "ceo"])))
-      .orderBy(sql`case when ${agents.role} = 'cto' then 0 else 1 end`, asc(agents.createdAt));
-    candidateIds.push(...roleCandidates.map((agent) => agent.id));
-    if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
-
-    const seen = new Set<string>();
-    for (const agentId of candidateIds) {
-      if (seen.has(agentId)) continue;
-      seen.add(agentId);
-      const candidate = await getAgent(agentId);
-      if (!candidate || candidate.companyId !== issue.companyId) continue;
-      const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
-        issueId: issue.id,
-        projectId: issue.projectId,
-      });
-      if (isAgentInvokable(candidate) && !budgetBlock) return candidate.id;
-    }
-
+  // Stranded-issue recovery (`stranded_assigned_issue` /
+  // SUCCESSFUL_RUN_MISSING_STATE_REASON) is an Explicit Recovery Action, not
+  // Auto-Recover -- it only runs after the single bounded auto-recovery wake
+  // (see doc/execution-semantics.md section 8) has already been exhausted.
+  // Per section 11, Paperclip "does not choose a replacement agent" for
+  // recovery ownership, and per section 12 recovery must "preserve
+  // ownership" and "escalate visibly when the system cannot safely keep
+  // going" rather than auto-select and wake a manager, creator, executive,
+  // or even the original (now-stranded) assignee. There is no existing,
+  // validated mechanism in this codebase for an operator to pre-authorize a
+  // specific automatic recovery-owner wake for a given issue/company, so
+  // this always board-escalates: the source issue keeps its original
+  // assignee, an explicit board-owned recovery action is opened, and no
+  // agent wake is enqueued. A human/operator must act -- either directly on
+  // the source issue or by manually assigning/waking a recovery owner.
+  async function resolveStrandedIssueRecoveryOwnerAgentId(_issue: typeof issues.$inferSelect) {
     return null;
   }
 

@@ -125,7 +125,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-recovery-actions-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
@@ -138,7 +138,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  });
+  }, 30_000);
 
   async function seedCompany() {
     const companyId = randomUUID();
@@ -290,12 +290,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[0]?.[1]?.payload).toMatchObject({
-      issueId: sourceIssue.id,
-      sourceIssueId: sourceIssue.id,
-      recoveryCause: "stranded_assigned_issue",
-    });
+    // Stranded-issue recovery board-escalates and does not auto-select an
+    // agent to wake (doc/execution-semantics.md section 11).
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
@@ -344,13 +341,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     expect(actionRows[0]?.evidence).toMatchObject({ latestRunId: secondLatestRun.id });
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[1]?.[1]?.payload).toMatchObject({
-      issueId: sourceIssue.id,
-      sourceIssueId: sourceIssue.id,
-      strandedRunId: secondLatestRun.id,
-      recoveryCause: "stranded_assigned_issue",
-    });
+    // Board-escalation only -- no agent wake for stranded-issue recovery.
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
@@ -416,6 +408,147 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("Recovery action:");
+  });
+
+  it("board-escalates stranded recovery without auto-waking the manager, even though the manager is invokable", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    // Matches the real incident: the assignee is paused when its issue is
+    // marked blocked, and a normal invokable manager is reachable via
+    // reportsTo. Per doc/execution-semantics.md section 11, Paperclip must
+    // not choose a replacement agent for stranded-issue recovery -- not
+    // even an otherwise-valid, invokable, budget-clear manager.
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(updatedIssue?.status).toBe("blocked");
+    // Ownership stays on the original (now-paused) assignee. Recovery does
+    // not reassign to the manager, and does not silently drop ownership
+    // either.
+    expect(updatedIssue?.assigneeAgentId).toBe(coderId);
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      ownerType: "board",
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+
+    // No automatic wake to the manager, the paused original assignee, or
+    // anyone else.
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("board escalation");
+    expect(comments[0]?.body).not.toContain(managerId);
+  });
+
+  it("board-escalates stranded recovery even when the manager is a CTO/CEO executive role and fully invokable", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    // seedCompany's manager already has role "cto", exercising the
+    // executive-role branch of the old candidate search. It must still not
+    // be auto-woken.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, managerId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows[0]).toMatchObject({ ownerType: "board", ownerAgentId: null });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("board-escalates stranded recovery for the issue creator's own manager and the creator itself", async () => {
+    const { companyId, managerId, coderId } = await seedCompany();
+    // Build a second issue whose createdByAgentId (not assigneeAgentId)
+    // points at coderId, so the old code's creator/creator's-manager
+    // candidate branch would have been exercised.
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId,
+      title: "Created-by candidate coverage",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      createdByAgentId: coderId,
+      issueNumber: 2,
+      identifier: "RA-CREATEDBY-1",
+    });
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    const [secondIssue] = await db.select().from(issues).where(eq(issues.id, secondIssueId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: secondIssue!,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, secondIssueId));
+    expect(updatedIssue?.assigneeAgentId).toBe(coderId);
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, secondIssueId));
+    expect(actionRows[0]).toMatchObject({ ownerType: "board", ownerAgentId: null });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    void managerId;
   });
 
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {

@@ -529,6 +529,13 @@ export const addIssueCommentSchema = z.object({
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
+  // Explicit, enforceable "comment without wake" control. Defaults to true
+  // (current behavior: a comment on a non-closed issue wakes the assignee)
+  // when omitted, so existing callers are unaffected. Set false to record
+  // evidence/notes on an issue without triggering any assignment wakeup,
+  // regardless of `resume`/`reopen`. `reopen`/`resume` still control status
+  // transitions independently of whether a wake is sent.
+  wake: z.boolean().optional(),
 });
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;
