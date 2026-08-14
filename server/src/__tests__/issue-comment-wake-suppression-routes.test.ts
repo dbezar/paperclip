@@ -201,6 +201,33 @@ describe("issue comment wake suppression", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it("does not wake when a board comment implicitly reopens a blocked issue with wake:false", async () => {
+    const issue = makeIssue({ status: "blocked" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 0 });
+    mockIssueService.update.mockResolvedValue({ ...issue, status: "todo" });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-implicit-reopen",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: "record the accepted result without launching the assignee",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({
+        body: "record the accepted result without launching the assignee",
+        wake: false,
+      });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setImmediate(resolve));
+    // Board comments implicitly reopen eligible blocked issues. The status
+    // transition is allowed, but the explicit wake suppression must survive it.
+    expect(mockIssueService.update).toHaveBeenCalledWith(issue.id, { status: "todo" });
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("does not wake @-mentioned agents when wake:false is set", async () => {
     const issue = makeIssue();
     mockIssueService.getById.mockResolvedValue(issue);
